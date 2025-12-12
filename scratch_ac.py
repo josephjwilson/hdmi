@@ -179,3 +179,160 @@ rgb_stack = contrast_enhance(rgb_stack, method="quantile")
 Plotter.plot_report_figure(rgb_stack)
 
 # %%
+"""
+FFT Analysis and Reconstruction Experiments
+(todo: needs to be integrated into the main pipepline)
+"""
+
+# %%
+
+import matplotlib.pyplot as plt
+from scipy.fft import fft, fftshift, fftfreq
+
+# %%
+
+pixel_clock = FV_AUTOMATED * CONFIG.h_total * CONFIG.v_total
+
+# %%
+
+from scipy.signal import resample, butter, sosfiltfilt
+
+# This is based on my existing code.
+# It should be ported at some point.
+def manual_reconstruction(
+    iq_data: np.ndarray, 
+    frame_dims: tuple[int, int], 
+    sample_rate: float, 
+    max_frames: int = 5, 
+    pixel_offset: int = 0, 
+    pixel_clock: float | None = None
+) -> np.ndarray:    
+    duration = len(iq_data) / sample_rate
+    target_samples = int(duration * pixel_clock)
+
+    # Sinc interpolation
+    resampled_signal = resample(iq_data, target_samples)
+    
+    frames_flat = slice_signal(
+        resampled_signal, 
+        frame_dims, 
+        oversampling_factor=1, 
+        start_offset=pixel_offset
+    )
+    
+    # Reshape and limit number of frames
+    num_pixels = frame_dims[0] * frame_dims[1]
+    num_frames_available = len(frames_flat) // num_pixels
+    
+    if max_frames > 0:
+        num_frames_available = min(num_frames_available, max_frames)
+        
+    frames_flat = frames_flat[:num_frames_available * num_pixels]
+    
+    if len(frames_flat) == 0:
+        return np.array([])
+        
+    final_frames = frames_flat.reshape((num_frames_available, frame_dims[1], frame_dims[0]))
+        
+    return final_frames
+
+def slice_signal(
+    iq_data: np.ndarray,
+    frame_dims: tuple[int, int],
+    oversampling_factor: int,
+    start_offset: int | tuple[int, int],
+) -> np.ndarray:
+    width, height = frame_dims
+    pixels_per_frame = width * height
+    
+    if isinstance(start_offset, tuple):
+        px, line = start_offset
+        sample_offset = (line * width + px) * oversampling_factor
+    else:
+        sample_offset = start_offset
+        
+    sliced_signal = iq_data[sample_offset:]
+    
+    remainder = len(sliced_signal) % (pixels_per_frame * oversampling_factor)
+    if remainder != 0:
+        sliced_signal = sliced_signal[:-remainder]
+        
+    return sliced_signal
+
+def compute_phase_diff(
+    iq_data: np.ndarray,
+    sample_rate: float,
+    lpf_cutoff: float = 1e4
+) -> np.ndarray:
+    filtered_signal = sosfiltfilt(
+        butter(N=8, Wn=lpf_cutoff, btype="low", output="sos", fs=sample_rate), 
+        iq_data)
+    
+    phase_diff = np.angle(filtered_signal[1:] * np.conj(filtered_signal[:-1]))
+    phase_diff = np.pad(phase_diff, (1, 0), mode="edge")
+    
+    return phase_diff
+
+# %%
+
+frames_uncorrected = manual_reconstruction(iq_400, CONFIG.frame_dims, CONFIG.sample_rate, max_frames=30, pixel_offset=offset_400, pixel_clock=pixel_clock)
+# %%
+Plotter.plot_rg_visual(frames_uncorrected[0], "Figure X (Left): Uncorrected Frame (Real/Green)")
+# %%
+Plotter.plot_hsv_visual(frames_uncorrected[0], "Figure X (Right): Uncorrected Frame (HSV)")
+# %%
+
+FC = 400e6
+FP_STANDARD = 25.175e6
+
+# %%
+Plotter.plot_spectrum_analysis(iq_400, CONFIG.sample_rate, FC, FP_STANDARD)
+
+# %%
+logger.info("Performing Frequency Correction (Static Shift)...")
+fft_vals = fftshift(fft(iq_400))
+freqs = fftshift(fftfreq(len(iq_400), d=1/CONFIG.sample_rate))
+freq_shift = freqs[np.argmax(np.abs(fft_vals))]
+
+logger.info(f"Shift Frequency detected: {freq_shift:.2f} Hz")
+
+# Manually applying shift for demonstration
+t = np.arange(len(iq_400)) / CONFIG.sample_rate
+phasor = np.exp(-1j * 2 * np.pi * freq_shift * t)
+signal_shifted = iq_400 * phasor
+# %%
+
+phase_diff = compute_phase_diff(signal_shifted, CONFIG.sample_rate)
+freq_profile_hz = phase_diff * CONFIG.sample_rate / (2 * np.pi)
+logger.info("Plotting Frequency Deviation Profile")
+plt.figure(figsize=(10, 6))
+time_ms = np.arange(len(freq_profile_hz)) / CONFIG.sample_rate * 1000
+plt.plot(time_ms, freq_profile_hz, linewidth=1)
+plt.xlabel("Time (ms)")
+plt.ylabel("Frequency Deviation (Hz)")
+plt.tight_layout()
+plt.show()
+
+# %%
+
+logger.info("Plotting Dynamic Phase Correction")
+pad_len = len(signal_shifted) - len(freq_profile_hz)
+correction_freq = np.pad(freq_profile_hz, (0, pad_len), 'edge') if pad_len > 0 else freq_profile_hz[:len(signal_shifted)]
+
+cumulative_phase_correction = np.cumsum(correction_freq) * (2 * np.pi / CONFIG.sample_rate)
+dynamic_phasor = np.exp(-1j * cumulative_phase_correction)
+signal_corrected = signal_shifted * dynamic_phasor
+
+logger.info("Plotting Spectrum Comparison")
+Plotter.plot_peak_comparison(signal_shifted, signal_corrected, CONFIG.sample_rate)
+
+# %%
+frames_corrected = manual_reconstruction(signal_corrected, CONFIG.frame_dims, CONFIG.sample_rate, max_frames=30, pixel_offset=offset_400, pixel_clock=pixel_clock)
+coherent_avg = np.mean(frames_corrected, axis=0)
+
+# Real/Green Visual
+logger.info("Plotting Corrected RG")
+Plotter.plot_rg_visual(frames_corrected[0], "Figure 7: Reconstructed Frame (Real=Red, Imag=Green)", 0)
+
+logger.info("Plotting Corrected and Corrent HSV")
+Plotter.plot_hsv_visual(coherent_avg, "Figure 6: Coherent Average (Noise Reduced)")

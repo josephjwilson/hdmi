@@ -1,5 +1,8 @@
 import numpy as np
 import scipy.signal as signal
+from scipy.signal import butter, sosfiltfilt
+import numpy as np
+from scipy.signal import resample
 
 from pathlib import Path
 from typing import Literal
@@ -159,3 +162,88 @@ def _stretch_minmax(arr: np.ndarray, axis=None) -> np.ndarray:
     diff[diff == 0] = 1.0 
     out = (arr - mn) / diff
     return np.clip(out, 0, 1)
+
+def manual_reconstruction(
+    iq_data: np.ndarray, 
+    frame_dims: tuple[int, int], 
+    sample_rate: float, 
+    max_frames: int = 5, 
+    pixel_offset: int = 0, 
+    pixel_clock: float | None = None
+) -> np.ndarray:    
+    duration = len(iq_data) / sample_rate
+    target_samples = int(duration * pixel_clock)
+
+    # Sinc interpolation
+    resampled_signal = resample(iq_data, target_samples)
+    
+    frames_flat = slice_signal(
+        resampled_signal, 
+        frame_dims, 
+        oversampling_factor=1, 
+        start_offset=pixel_offset
+    )
+    
+    num_pixels = frame_dims[0] * frame_dims[1]
+    num_frames_available = len(frames_flat) // num_pixels
+    
+    if max_frames > 0:
+        num_frames_available = min(num_frames_available, max_frames)
+        
+    frames_flat = frames_flat[:num_frames_available * num_pixels]
+    
+    if len(frames_flat) == 0:
+        return np.array([])
+        
+    final_frames = frames_flat.reshape((num_frames_available, frame_dims[1], frame_dims[0]))
+        
+    return final_frames
+
+
+def slice_signal(
+    iq_data: np.ndarray,
+    frame_dims: tuple[int, int],
+    oversampling_factor: int,
+    start_offset: int | tuple[int, int],
+) -> np.ndarray:
+    """
+    Slice the signal starting from a specific offset.
+    
+    Args:
+        iq_data: Raw 1D IQ buffer.
+        frame_dims: (Width, Height) of the frame (Total).
+        oversampling_factor: Number of samples per pixel.
+        start_offset: Either samples count or (pixel, line) tuple.
+    """
+    width, height = frame_dims
+    pixels_per_frame = width * height
+    
+    if isinstance(start_offset, tuple):
+        px, line = start_offset
+        sample_offset = (line * width + px) * oversampling_factor
+    else:
+        sample_offset = start_offset
+        
+    sliced_signal = iq_data[sample_offset:]
+    
+    remainder = len(sliced_signal) % (pixels_per_frame * oversampling_factor)
+    if remainder != 0:
+        sliced_signal = sliced_signal[:-remainder]
+        
+    return sliced_signal
+
+def compute_phase_diff(
+    iq_data: np.ndarray,
+    sample_rate: float,
+    lpf_cutoff: float = 1000.0
+) -> np.ndarray:
+    """
+    Calculate the instantaneous frequency deviation profile (phase diff).
+    """
+    sos = butter(N=8, Wn=lpf_cutoff, btype="low", output="sos", fs=sample_rate)
+    filtered_signal = sosfiltfilt(sos, iq_data)
+    
+    phase_diff = np.angle(filtered_signal[1:] * np.conj(filtered_signal[:-1]))
+    phase_diff = np.pad(phase_diff, (1, 0), mode="edge")
+    
+    return phase_diff
